@@ -30,6 +30,7 @@ from pathlib import Path
 # import logging
 import warnings
 import time
+import pickle
 import sys
 
 import torch.backends.cudnn as cudnn
@@ -43,7 +44,7 @@ import yaml
 
 mod_name = vars(sys.modules[__name__])['__name__']
 
-if 'rmsgd.' in mod_name:
+if 'adas.' in mod_name:
     from .optim.lr_scheduler import CosineAnnealingWarmRestarts, StepLR, \
         OneCycleLR
     from .optim import get_optimizer_scheduler
@@ -57,7 +58,7 @@ if 'rmsgd.' in mod_name:
     from .optim.sls import SLS
     from .optim.sps import SPS
     from .data import get_data
-    from .optim.rmsgd import RMSGD
+    from .optim.adas import Adas
 else:
     from optim.lr_scheduler import CosineAnnealingWarmRestarts, StepLR, \
         OneCycleLR
@@ -72,12 +73,12 @@ else:
     from optim.sls import SLS
     from optim.sps import SPS
     from data import get_data
-    from optim.rmsgd import RMSGD
+    from optim.adas import Adas
 
 
 def args(sub_parser: _SubParsersAction):
     # print("\n---------------------------------")
-    # print("RMSGD Train Args")
+    # print("Adas Train Args")
     # print("---------------------------------\n")
     # sub_parser.add_argument(
     #     '-vv', '--very-verbose', action='store_true',
@@ -95,16 +96,16 @@ def args(sub_parser: _SubParsersAction):
         help="Set configuration file path: Default = 'config.yaml'")
     sub_parser.add_argument(
         '--data', dest='data',
-        default='.rmsgd-data', type=str,
-        help="Set data directory path: Default = '.rmsgd-data'")
+        default='.adas-data', type=str,
+        help="Set data directory path: Default = '.adas-data'")
     sub_parser.add_argument(
         '--output', dest='output',
-        default='.rmsgd-output', type=str,
-        help="Set output directory path: Default = '.rmsgd-output'")
+        default='.adas-output', type=str,
+        help="Set output directory path: Default = '.adas-output'")
     sub_parser.add_argument(
         '--checkpoint', dest='checkpoint',
-        default='.rmsgd-checkpoint', type=str,
-        help="Set checkpoint directory path: Default = '.rmsgd-checkpoint'")
+        default='.adas-checkpoint', type=str,
+        help="Set checkpoint directory path: Default = '.adas-checkpoint'")
     sub_parser.add_argument(
         '--resume', dest='resume',
         default=None, type=str,
@@ -152,15 +153,17 @@ def args(sub_parser: _SubParsersAction):
         help='Node rank for distributed training: Default = -1')
 
     #New Custom Arguments: Group-C
+
     sub_parser.add_argument(
-        '--S', default=[10, 50, 100], type=list,
+        '--S', default='10 50 100', type=str,
         help='List of S for probing test: Default = [10, 50, 100]')
     sub_parser.add_argument(
-        '--J', default=[0.5, 1, 1.66], type=list,
+        '--J', default='0.5 1 1.66', type=str,
         help='List of J for probing test: Default = [0.5, 1, 1.66]')
     sub_parser.add_argument(
-        '--sampling', default=['default'], type=list,
+        '--sampling', default='default', type=str,
         help='List of sampling for probing test: Default = [\'default\']')
+
     # sub_parser.add_argument(
     #     '--cutout', action='store_true',
     #     default=False,
@@ -224,15 +227,19 @@ class TrainingAgent:
         self.checkpoint_path = checkpoint_path
 
         #Adding custom agruments to self
-        self.S = args.S
-        self.J = args.J
-        self.sampling = args.sampling
-        self.RMSGD_config = {}
+
+        self.S = (args.S).split(' ')
+        self.S = [int(s) for s in self.S]
+        self.J = (args.J).split(' ')
+        self.J = [float(j) for j in self.J]
+        self.sampling = (args.sampling).split(' ')
+        self.batch_stops = dict()
+        self.encodings = []
 
 
         self.load_config(config_path, data_path)
         self.load_iterations()
-        print("RMSGD: Experiment Configuration")
+        print("Adas: Experiment Configuration")
         print("-"*45)
         for k, v in self.config.items():
             if isinstance(v, list) or isinstance(v, dict):
@@ -241,8 +248,7 @@ class TrainingAgent:
                 print(f"    {k:<20} {v:<20}")
         print("-"*45)
 
-    
-    def load_config(self, config_path: Path, data_path: Path) -> None: #Called on line 233
+    def load_config(self, config_path: Path, data_path: Path) -> None:
         with config_path.open() as f:
             self.config = config = parse_config(yaml.load(f))
         if self.device == 'cpu':
@@ -266,13 +272,13 @@ class TrainingAgent:
         self.criterion = torch.nn.CrossEntropyLoss().cuda(self.gpu) if \
             config['loss'] == 'cross_entropy' else None
         if np.less(float(config['early_stop_threshold']), 0):
-            print("RMSGD: Notice: early stop will not be used as it was " +
+            print("Adas: Notice: early stop will not be used as it was " +
                   f"set to {config['early_stop_threshold']}, " +
                   "training till completion")
         elif config['optimizer'] != 'SGD' and \
-                config['scheduler'] != 'RMSGD':
-            print("RMSGD: Notice: early stop will not be used as it is not " +
-                  "SGD with RMSGD, training till completion")
+                config['scheduler'] != 'Adas':
+            print("Adas: Notice: early stop will not be used as it is not " +
+                  "SGD with Adas, training till completion")
             config['early_stop_threshold'] = -1.
         self.early_stop = EarlyStop(
             patience=int(config['early_stop_patience']),
@@ -290,30 +296,31 @@ class TrainingAgent:
             self.best_acc1 = self.checkpoint['best_acc1']
             print(f'Resuming config for trial {self.start_trial} at ' +
                   f'epoch {self.start_epoch}')
-        # self.reset()
+
+        #self.reset()
 
     def load_iterations(self):
-        if(self.sampling == 'Default'):
-            for i in range(len(self.train_loader)):
-                self.RMSGD_config['batch_index'][i] = []
-            for s in self.S:
-                for j in self.J:
-                    encoding = "S" + str(s) + "_J" + str(j)
-                    #self.RMSGD_config['batch_index'][encoding]
-                    index = s
-                    while(index < len(self.train_loader)):
-                        #print(self.RMSGD_config['batch_index'][encoding][-1])
-                        self.RMSGD_config['batch_index'][index].append(encoding)
-                        index += int(j*s)
-
-
+        for i in range(len(self.train_loader)):
+            self.batch_stops[i] = []
+        for s in self.S:
+            for j in self.J:
+                encoding = "S" + str(s) + "_J" + str(j)
+                self.encodings.append(encoding)
+                index = s
+                while(index < len(self.train_loader)):
+                    #print(self.RMSGD_config['batch_index'][encoding][-1])
+                    self.batch_stops[index-1].append(encoding)
+                    index += int(j*s)
 
     def reset(self, learning_rate: float) -> None:
         self.performance_statistics = dict()
         self.network = get_network(name=self.config['network'],
                                    num_classes=self.num_classes)
         self.metrics = Metrics(list(self.network.parameters()),
-                               p=self.config['p'])
+                               p=self.config['p'],
+                               hyper_selection=self.encodings,
+                               saves=self.batch_stops)
+
         # TODO add other parallelisms
         if self.device == 'cpu':
             print("Resetting cpu-based network")
@@ -405,6 +412,10 @@ class TrainingAgent:
                 trial, epoch)
             test_loss, (test_acc1, test_acc5) = self.validate(epoch)
             end_time = time.time()
+
+            with open(self.output_filename.replace(".xlsx",'.pickle'),'wb') as handle:
+                pickle.dump(self.metrics.output, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
             if isinstance(self.scheduler, StepLR):
                 self.scheduler.step()
             total_time = time.time()
@@ -428,7 +439,7 @@ class TrainingAgent:
 
             df.to_excel(self.output_filename)
             if self.early_stop(train_loss):
-                print("RMSGD: Early stop activated.")
+                print("Adas: Early stop activated.")
                 break
             if not self.mpd or \
                     (self.mpd and self.rank % self.ngpus_per_node == 0):
@@ -453,8 +464,8 @@ class TrainingAgent:
         torch.save(data, str(self.checkpoint_path / 'last.pth.tar'))
 
     def epoch_iteration(self, trial: int, epoch: int):
-        # logging.info(f"RMSGD: Train: Epoch: {epoch}")
-        # global net, performance_statistics, metrics, rmsgd, config
+        # logging.info(f"Adas: Train: Epoch: {epoch}")
+        # global net, performance_statistics, metrics, adas, config
         self.network.train()
         train_loss = 0
         top1 = AverageMeter()
@@ -491,7 +502,7 @@ class TrainingAgent:
                 self.optimizer.first_step(zero_grad=True)
                 outputs = self.network(inputs)
                 self.criterion(outputs, targets).backward()
-                if isinstance(self.scheduler, RMSGD):
+                if isinstance(self.scheduler, Adas):
                     self.optimizer.second_step(
                         self.metrics.layers_index_todo,
                         self.scheduler.lr_vector, zero_grad=True)
@@ -501,7 +512,7 @@ class TrainingAgent:
                 outputs = self.network(inputs)
                 loss = self.criterion(outputs, targets)
                 loss.backward()
-                # if isinstance(self.scheduler, RMSGD):
+                # if isinstance(self.scheduler, Adas):
                 #     self.optimizer.step(self.metrics.layers_index_todo,
                 #                         self.scheduler.lr_vector)
                 if isinstance(self.optimizer, SPS):
@@ -523,6 +534,10 @@ class TrainingAgent:
             top5.update(acc5[0], inputs.size(0))
             if isinstance(self.scheduler, OneCycleLR):
                 self.scheduler.step()
+
+            print("BATCH ITERATION "+str(batch_idx))
+            self.metrics.batch_iter(batch_idx)
+
         self.performance_statistics[f'train_acc1_epoch_{epoch}'] = \
             top1.avg.cpu().item() / 100.
         self.performance_statistics[f'train_acc5_epoch_{epoch}'] = \
@@ -553,14 +568,14 @@ class TrainingAgent:
         #         print(k, len(v))
         #     except Exception:
         #         pass
-        # if GLOBALS.RMSGD is not None:
+        # if GLOBALS.ADAS is not None:
         if self.num_classes == 2:
             fpr, tpr, thresholds = metrics.roc_curve(
                 tgts, preds, pos_label=1)
             auc = metrics.auc(fpr, tpr)
             print("Train AUC:", auc)
             self.performance_statistics[f'train_auc_epoch_{epoch}'] = auc
-        if isinstance(self.optimizer, RMSGD):
+        if isinstance(self.optimizer, Adas):
             self.optimizer.epoch_step(epoch)
             kg = self.optimizer.KG
             new_kg = list()
@@ -585,7 +600,7 @@ class TrainingAgent:
                     self.optimizer, SPS) or isinstance(self.optimizer, AdaSLS):
                 self.performance_statistics[f'aearning_rate_epoch_{epoch}'] = \
                     self.optimizer.state['step_size']
-            # elif isinstance(self.optimizer, RMSGD):
+            # elif isinstance(self.optimizer, Adas):
             #     lr_vec = self.optimizer.param_groups[0]['lr']
             #     new_lr_vec = list()
             #     count = 0
@@ -649,13 +664,13 @@ class TrainingAgent:
         # Save checkpoint.
         # acc = 100. * correct / total
         # if acc > self.best_acc:
-        #     # print('RMSGD: Saving checkpoint...')
+        #     # print('Adas: Saving checkpoint...')
         #     state = {
         #         'net': self.network.state_dict(),
         #         'acc': acc,
         #         'epoch': epoch + 1,
         #     }
-        #     if not isinstance(self.scheduler, RMSGD):
+        #     if not isinstance(self.scheduler, Adas):
         #         state['historical_io_metrics'] = \
         #             self.metrics.historical_metrics
         #     torch.save(state, str(self.checkpoint_path / 'ckpt.pth'))
@@ -722,12 +737,12 @@ def setup_dirs(args: APNamespace) -> Tuple[Path, Path, Path, Path]:
     checkpoint_path = root_path / Path(args.checkpoint).expanduser()
 
     if not config_path.exists():
-        raise ValueError(f"RMSGD: Config path {config_path} does not exist")
+        raise ValueError(f"Adas: Config path {config_path} does not exist")
     if not data_path.exists():
-        print(f"RMSGD: Data dir {data_path} does not exist, building")
+        print(f"Adas: Data dir {data_path} does not exist, building")
         data_path.mkdir(exist_ok=True, parents=True)
     if not output_path.exists():
-        print(f"RMSGD: Output dir {output_path} does not exist, building")
+        print(f"Adas: Output dir {output_path} does not exist, building")
         output_path.mkdir(exist_ok=True, parents=True)
     if not checkpoint_path.exists():
         checkpoint_path.mkdir(exist_ok=True, parents=True)
@@ -739,7 +754,7 @@ def setup_dirs(args: APNamespace) -> Tuple[Path, Path, Path, Path]:
 
 
 def main(args: APNamespace):
-    print("RMSGD: Argument Parser Options")
+    print("Adas: Argument Parser Options")
     print("-"*45)
     for arg in vars(args):
         attr = getattr(args, arg)
@@ -784,7 +799,7 @@ def main_worker(gpu: int, ngpus_per_node: int, args: APNamespace):
         mpd=args.mpd,
         dist_url=args.dist_url,
         dist_backend=args.dist_backend)
-    print(f"RMSGD: Pytorch device is set to {training_agent.device}")
+    print(f"Adas: Pytorch device is set to {training_agent.device}")
     training_agent.train()
 
 

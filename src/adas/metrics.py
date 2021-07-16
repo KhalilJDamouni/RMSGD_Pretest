@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 mod_name = vars(sys.modules[__name__])['__name__']
-if 'rmsgd.' in mod_name:
+if 'adas.' in mod_name:
     from .components import LayerType, IOMetrics
     from .VBMF import EVBMF
 else:
@@ -37,18 +37,36 @@ else:
 
 
 class Metrics():
-    def __init__(self, parameters: List[Any], p: int) -> None:
+    def __init__(self, parameters: List[Any], p: int, hyper_selection: List[Any], saves) -> None:
         '''
         parameters: list of torch.nn.Module.parameters()
         '''
+        #WE NEED TO ADD SOME STUFF HERE TO DECIDE HOW MANY WEIGHTS TO SAVE
+        self.MAX = 30000
+        self.len = 0
+        self.output = dict()
+        for hyper in hyper_selection:
+            self.output[hyper] = {'SRLRF':[],'SR':[],'FNLRF':[],'FN':[],'ERLRF':[],'ER':[]}
+            self.len = max(self.len, int(hyper.split('_')[0][1:]))
+        self.weight_hist = list()
+        self.saves = saves
         self.net_blocks = net_blocks = parameters
         self.layers_index_todo = np.ones(shape=len(net_blocks), dtype='bool')
+        self.random_selection = list()
         self.layers_info = list()
         self.number_of_conv = 0
         self.number_of_fc = 0
         self.p = p
         self.historical_metrics = list()
         for iteration_block in range(len(net_blocks)):
+            for hyper in hyper_selection:
+                for measure in self.output[hyper].keys():
+                    self.output[hyper][measure].append([])
+            self.weight_hist.append(0)
+            self.weight_hist[iteration_block]=np.empty((np.prod(net_blocks[iteration_block].shape),1))
+            self.random_selection.append(0)
+            if(np.prod(net_blocks[iteration_block].shape)>self.MAX):
+                self.random_selection[iteration_block] = np.random.choice(np.prod(net_blocks[iteration_block].shape),size=self.MAX,replace=False)
             block_shape = net_blocks[iteration_block].shape
             if len(block_shape) == 4:
                 self.layers_info = np.concatenate(
@@ -69,6 +87,65 @@ class Metrics():
                            self.layers_info[i] == LayerType.FC]
         self.non_conv_indices = [i for i in range(len(self.layers_info)) if
                                  self.layers_info[i] == LayerType.NON_CONV]
+
+
+    def batch_iter(self, batch: int):
+        '''
+        Saves history of model weights
+        Computes measures on history of model weights
+        '''
+        #history
+
+        for iteration_block in range(len(self.net_blocks)):
+            weight = self.net_blocks[iteration_block].cpu().data
+            weight = torch.reshape(weight, [-1,1])
+            self.weight_hist[iteration_block] = np.concatenate((self.weight_hist[iteration_block], weight),axis=1)
+            if batch>self.len:
+                self.weight_hist[iteration_block] = self.weight_hist[iteration_block][1:]
+
+        #computations
+        for config in self.saves[batch]:
+            size = int(config.split('_')[0][1:])
+            #jump = int(size*int(config.split('_')[1][1:]))
+
+            for iteration_block in range(len(self.net_blocks)):
+                #formattin, slicing
+                #can add the random selection stuff here, vert and horizontal
+                slice = self.weight_hist[iteration_block][:,-size:]
+                slice_shape = slice.shape
+                if(slice_shape[0]>slice_shape[1]):
+                    slice = slice.T
+                    slice_shape = slice.shape
+                slice = torch.from_numpy(slice)
+
+                #reduce size
+                if(slice_shape[1]>self.MAX):
+                    slice = slice[:,self.random_selection[iteration_block]]
+
+                #LRF
+                U_approx, S_approx, V_approx = EVBMF(slice)
+                low_rank_eigen = torch.diag(S_approx).data.numpy()
+                if len(low_rank_eigen) != 0:
+                    self.output[config]['SRLRF'][iteration_block].append(np.sum(low_rank_eigen/np.max(low_rank_eigen))/slice_shape[0])
+                    self.output[config]['FNLRF'][iteration_block].append(np.sqrt(np.sum(low_rank_eigen**2)))
+                    self.output[config]['ERLRF'][iteration_block].append(-np.sum(np.multiply(low_rank_eigen/np.sum(low_rank_eigen),np.log(low_rank_eigen/np.sum(low_rank_eigen)))))
+                else:
+                    self.output[config]['SRLRF'][iteration_block].append(0)
+                    self.output[config]['FNLRF'][iteration_block].append(0)
+                    self.output[config]['ERLRF'][iteration_block].append(0)
+
+                #raw
+                U, S, V = torch.svd(slice)
+                eigen = S.data.numpy()
+                if len(eigen) != 0:
+                    self.output[config]['SR'][iteration_block].append(np.sum(eigen/np.max(eigen))/slice_shape[0])
+                    self.output[config]['FN'][iteration_block].append(np.sqrt(np.sum(eigen**2)))
+                    self.output[config]['ER'][iteration_block].append(-np.sum(np.multiply(eigen/np.sum(eigen),np.log(eigen/np.sum(eigen)))))
+                else:
+                    self.output[config]['SR'][iteration_block].append(0)
+                    self.output[config]['FN'][iteration_block].append(0)
+                    self.output[config]['ER'][iteration_block].append(0)
+
 
     def evaluate(self, epoch: int) -> IOMetrics:
         '''
